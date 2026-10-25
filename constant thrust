@@ -1,0 +1,166 @@
+#include <ESP32Servo.h>
+
+// --- PIN TANIMLARI ---
+const int ESC_PIN = 18;         // ESC Gaz Çıkışı[cite: 1]
+const int SERVO_PIN = 19;       // Çap Servosu Sinyal Çıkışı[cite: 1]
+const int TLM_RX_PIN = 16;      // AM32 ESC Telemetry Girişi[cite: 1]
+
+// --- MOTOR VE TELEMETRİ BİLGİLERİ ---
+const int MOTOR_POLE_PAIRS = 7; 
+
+// --- GAZ / GOVERNOR HEDEF SINIRLARI (MİKROSANİYE) ---
+const int THROTTLE_MIN = 1000;  
+const int THROTTLE_MAX = 2000;  
+
+// --- SERVO SINIRLARI ---
+const int SERVO_MIN_US = 500;
+const int SERVO_MAX_US = 2500;
+const int SERVO_MIN_ANGLE = 0;
+const int SERVO_MAX_ANGLE = 180;
+
+// --- NESNELER ---
+Servo escMotor;
+Servo diameterServo;
+
+// --- DURUM VE KONTROL DEĞİŞKENLERİ ---
+float actualRPM = 0.0;
+int currentThrottle = THROTTLE_MIN; 
+int currentAngle = SERVO_MIN_ANGLE;
+
+// İTKİ KONTROL (CONSTANT THRUST) DEĞİŞKENLERİ
+bool constantThrustMode = false; // Başlangıçta manuel mod aktif
+float targetThrustLevel = 0.0;   // 0 ile 100 arasında soyut bir itki hedefi
+
+// Zamanlayıcı
+unsigned long lastPlotTime = 0;
+const unsigned long PLOT_INTERVAL_MS = 50; 
+
+void readESCTelemetry() {
+  while (Serial2.available() >= 10) {
+    byte buffer[10];
+    for (int i = 0; i < 10; i++) {
+      buffer[i] = Serial2.read();
+    }
+    uint16_t erpmRaw = (buffer[7] << 8) | buffer[8];
+    float erpm = erpmRaw * 100.0;
+    actualRPM = erpm / MOTOR_POLE_PAIRS;
+  }
+}
+
+// --- SABİT İTKİ MATEMATİKSEL MODELİ ---
+// Çap arttıkça itkiyi sabit tutmak için RPM'i (gazı) düşüren fonksiyon
+void calculateConstantThrust() {
+  if (!constantThrustMode) return;
+
+  // ÖRNEK MODEL: 
+  // targetThrustLevel (0-100) -> Temel Gaz değerine çevrilir.
+  // currentAngle (0-180) -> Açı büyüdükçe (çap arttıkça) gaz azaltılır.
+  
+  // 1. Hedef itkiye göre gereken taban gazı hesapla (Açı 0 iken gereken gaz)
+  float baseThrottle = map(targetThrustLevel, 0, 100, THROTTLE_MIN, THROTTLE_MAX);
+  
+  // 2. Çap (Açı) kompanzasyonu. 
+  // (Not: Bu katsayıyı pervanenin gerçek aerodinamik testlerine göre deneme-yanılma ile revize edebilirsin)
+  // Örneğin 180 derecede %20 daha az RPM gerekiyorsa katsayı 0.8 olur.
+  float angleCompensationFactor = map(currentAngle, 0, 180, 100, 80) / 100.0; 
+
+  // 3. Yeni gazı hesapla ve uygula
+  int compensatedThrottle = baseThrottle * angleCompensationFactor;
+  
+  // Güvenlik sınırlarını aşmadığından emin ol
+  currentThrottle = constrain(compensatedThrottle, THROTTLE_MIN, THROTTLE_MAX);
+  escMotor.writeMicroseconds(currentThrottle);
+}
+
+
+void setup() {
+  Serial.begin(115200);                               
+  Serial2.begin(115200, SERIAL_8N1, TLM_RX_PIN, -1); 
+
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  escMotor.setPeriodHertz(50);
+  diameterServo.setPeriodHertz(50);
+
+  escMotor.attach(ESC_PIN, THROTTLE_MIN, THROTTLE_MAX);
+  diameterServo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+
+  // Başlangıç Güvenliği
+  escMotor.writeMicroseconds(THROTTLE_MIN);
+  diameterServo.write(currentAngle);
+  delay(3000); 
+
+  Serial.println("--- VDR KONTROLCUSU BASLADI ---");
+  Serial.println("Komutlar:");
+  Serial.println("T<deger> : Manuel Gaz Ayari (1000-2000)");
+  Serial.println("C<aci>   : Cap Acisi Ayari (0-180)");
+  Serial.println("F<deger> : Sabit Itki Moduna Gec ve Itkiyi Ayarla (0-100)");
+  Serial.println("M0       : Manuel Moda Don (F komutunu iptal eder)");
+  Serial.println("STOP     : Acil Durdurma");
+}
+
+void loop() {
+  // 1. Bilgisayardan Komut Dinleme
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    input.toUpperCase(); // Komutları büyük harfe standartla
+
+    if (input.equals("STOP")) {
+      constantThrustMode = false;
+      currentThrottle = THROTTLE_MIN;
+      escMotor.writeMicroseconds(THROTTLE_MIN);
+      Serial.println("ACIL DURDURMA AKTIF!");
+    } 
+    // M0: Manuel Moda Dön
+    else if (input.equals("M0")) {
+      constantThrustMode = false;
+      Serial.println("Mod: MANUEL (Gaz ve Aci ayri ayri kontrol ediliyor)");
+    }
+    // F: Sabit İtki Moduna Geç ve Hedef Belirle (0-100 arası)
+    else if (input.startsWith("F")) {
+      constantThrustMode = true;
+      targetThrustLevel = constrain(input.substring(1).toFloat(), 0, 100);
+      Serial.print("Mod: SABIT ITKI (Constant Thrust) | Hedef Guc: %");
+      Serial.println(targetThrustLevel);
+      calculateConstantThrust(); // Anında uygula
+    }
+    // T: Manuel Gaz Komutu
+    else if (input.startsWith("T")) {
+      if (constantThrustMode) {
+        Serial.println("Uyari: Sabit Itki modundasiniz. Gaz komutu (T) icin once M0 gonderin.");
+      } else {
+        int requestedThrottle = input.substring(1).toInt();
+        currentThrottle = constrain(requestedThrottle, THROTTLE_MIN, THROTTLE_MAX);
+        escMotor.writeMicroseconds(currentThrottle);
+      }
+    } 
+    // C: Kanat Çap Açısı (0 - 180 derece)
+    else if (input.startsWith("C")) {
+      currentAngle = constrain(input.substring(1).toInt(), SERVO_MIN_ANGLE, SERVO_MAX_ANGLE);
+      diameterServo.write(currentAngle);
+      
+      // Eğer Sabit İtki modundaysak, açı değiştiği için gazı yeniden hesapla
+      if (constantThrustMode) {
+        calculateConstantThrust();
+      }
+    }
+  }
+
+  // 2. Canlı Devri Oku
+  readESCTelemetry();
+
+  // 3. Serial Plotter Çıktısı
+  if (millis() - lastPlotTime >= PLOT_INTERVAL_MS) {
+    lastPlotTime = millis();
+    
+    Serial.print("Aci:");
+    Serial.print(currentAngle);
+    Serial.print("\t");
+    Serial.print("Gaz_us:");
+    Serial.print(currentThrottle);
+    Serial.print("\t");
+    Serial.print("Gercek_RPM:");
+    Serial.println(actualRPM, 0);
+  }
+}
